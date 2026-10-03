@@ -6,7 +6,9 @@ const productSchema = new mongoose.Schema({
   category: { type: String, required: [true, 'Category is required'], trim: true, index: true },
   price: { type: Number, required: [true, 'Price is required'], min: [0, 'Price cannot be negative'] },
   stock: { type: Number, required: true, min: [0, 'Stock cannot be negative'], default: 0 },
-  attributes: { type: mongoose.Schema.Types.Mixed, default: {} }
+  attributes: { type: mongoose.Schema.Types.Mixed, default: {} },
+  averageRating: { type: Number, default: 0 },
+  reviewCount: { type: Number, default: 0 }
 }, {
   timestamps: true,
   toJSON: { virtuals: true },
