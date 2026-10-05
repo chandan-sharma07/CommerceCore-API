@@ -9,7 +9,7 @@ module.exports = (sequelize) => {
   return sequelize.define('Order', {
     id: { type: DataTypes.UUID, defaultValue: DataTypes.UUIDV4, primaryKey: true },
     user_id: { type: DataTypes.UUID, allowNull: false, references: { model: 'users', key: 'id' } },
-    status: { type: DataTypes.ENUM('pending', 'confirmed', 'shipped', 'delivered', 'cancelled'), defaultValue: 'pending', allowNull: false },
+    status: { type: DataTypes.ENUM('pending', 'confirmed', 'paid', 'failed', 'shipped', 'delivered', 'cancelled', 'stock_sync_failed'), defaultValue: 'pending', allowNull: false },
     total_amount: { type: DataTypes.DECIMAL(10, 2), allowNull: false },
     idempotency_key: { type: DataTypes.STRING(255), unique: true }
   }, {
