@@ -17,15 +17,15 @@ process.env.CORS_ORIGIN = '*';
 const { sequelize } = require('../src/models/mysql');
 const { connectMySQL } = require('../src/config/database');
 const mongoose = require('mongoose');
-const redisClient = require('../src/config/redis');
+const { redisClient, connectRedis } = require('../src/config/redis');
 
 beforeAll(async () => {
   await connectMySQL();
   await sequelize.sync({ force: true });
   await mongoose.connect(process.env.MONGO_URI);
-  // Optional depending on if redisClient connects on import or manually
-  if (!redisClient.isOpen) {
-    await redisClient.connect();
+  // Connect Redis (ioredis with lazyConnect)
+  if (redisClient.status === 'wait') {
+    await connectRedis();
   }
   
   if (mongoose.connection.db) {
@@ -41,6 +41,15 @@ afterEach(async () => {
     for (let collection of collections) {
       await collection.deleteMany({});
     }
+  }
+
+  // Flush Redis to prevent cached data leaking between tests
+  try {
+    if (redisClient.status === 'ready') {
+      await redisClient.flushdb();
+    }
+  } catch (err) {
+    // Ignore if Redis is unavailable
   }
 });
 
