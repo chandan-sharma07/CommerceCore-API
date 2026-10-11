@@ -1,7 +1,38 @@
 const winston = require('winston');
-const { combine, timestamp, errors, json, colorize, simple } = winston.format;
+const { AsyncLocalStorage } = require('async_hooks');
+const { combine, timestamp, errors, json, colorize, printf } = winston.format;
 
-// Safely get log level if config is not fully loaded yet
+// ── AsyncLocalStorage for request-scoped context ──────────────
+// Every incoming request runs inside asyncLocalStorage.run({ requestId }),
+// so any logger call anywhere in the call stack automatically picks up the ID.
+const asyncLocalStorage = new AsyncLocalStorage();
+
+// ── Custom Formats ────────────────────────────────────────────
+
+/**
+ * Injects requestId from AsyncLocalStorage into every log entry.
+ */
+const requestIdFormat = winston.format((info) => {
+  const store = asyncLocalStorage.getStore();
+  if (store && store.requestId) {
+    info.requestId = store.requestId;
+  }
+  return info;
+});
+
+/**
+ * Dev-friendly readable console format.
+ * Example: 18:30:45 info: [a1b2c3d4] Server running on port 3000
+ */
+const devFormat = printf(({ level, message, timestamp, requestId, stack, ...meta }) => {
+  const rid = requestId ? `[${requestId.substring(0, 8)}] ` : '';
+  const metaStr = Object.keys(meta).length ? ` ${JSON.stringify(meta)}` : '';
+  const stackStr = stack ? `\n${stack}` : '';
+  return `${timestamp} ${level}: ${rid}${message}${metaStr}${stackStr}`;
+});
+
+// ── Log Level ─────────────────────────────────────────────────
+
 const getLogLevel = () => {
   try {
     const config = require('../config/index');
@@ -11,14 +42,23 @@ const getLogLevel = () => {
   }
 };
 
+// ── Transports ────────────────────────────────────────────────
+
 const transports = [
   new winston.transports.Console({
-    format: process.env.NODE_ENV === 'production' 
-      ? combine(timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }), errors({ stack: true }), json())
-      : combine(colorize(), simple())
+    format: process.env.NODE_ENV === 'production'
+      ? combine(timestamp(), requestIdFormat(), errors({ stack: true }), json())
+      : combine(
+          colorize(),
+          timestamp({ format: 'HH:mm:ss' }),
+          requestIdFormat(),
+          errors({ stack: true }),
+          devFormat
+        )
   })
 ];
 
+// Production: persist error + combined logs to files
 if (process.env.NODE_ENV === 'production') {
   transports.push(
     new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
@@ -26,15 +66,34 @@ if (process.env.NODE_ENV === 'production') {
   );
 }
 
+// ── Logger Instance ───────────────────────────────────────────
+
 const logger = winston.createLogger({
   level: getLogLevel(),
   format: combine(
     timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+    requestIdFormat(),
     errors({ stack: true }),
     json()
   ),
-  transports
+  transports,
+  // Log uncaught exceptions and unhandled rejections via Winston
+  exceptionHandlers: [
+    new winston.transports.Console(),
+    ...(process.env.NODE_ENV === 'production'
+      ? [new winston.transports.File({ filename: 'logs/exceptions.log' })]
+      : [])
+  ],
+  rejectionHandlers: [
+    new winston.transports.Console(),
+    ...(process.env.NODE_ENV === 'production'
+      ? [new winston.transports.File({ filename: 'logs/rejections.log' })]
+      : [])
+  ],
+  exitOnError: false // let server.js handle graceful shutdown
 });
+
+// ── Morgan Stream ─────────────────────────────────────────────
 
 const morganStream = {
   write: (message) => logger.http(message.trim())
@@ -42,5 +101,6 @@ const morganStream = {
 
 module.exports = {
   logger,
-  morganStream
+  morganStream,
+  asyncLocalStorage
 };
