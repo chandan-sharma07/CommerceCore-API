@@ -21,7 +21,6 @@ const { redisClient, connectRedis } = require('../src/config/redis');
 
 beforeAll(async () => {
   await connectMySQL();
-  await sequelize.sync({ force: true });
   await mongoose.connect(process.env.MONGO_URI);
   // Connect Redis (ioredis with lazyConnect)
   if (redisClient.status === 'wait') {
@@ -31,10 +30,18 @@ beforeAll(async () => {
   if (mongoose.connection.db) {
     await mongoose.connection.db.dropDatabase();
   }
+
+  // Recreate MongoDB indexes (dropDatabase destroys them, e.g. text index for $text search)
+  const Product = require('../src/models/mongo/Product');
+  const Review = require('../src/models/mongo/Review');
+  await Product.ensureIndexes();
+  await Review.ensureIndexes();
 });
 
 afterEach(async () => {
+  await sequelize.query('SET FOREIGN_KEY_CHECKS = 0');
   await sequelize.truncate({ cascade: true, force: true });
+  await sequelize.query('SET FOREIGN_KEY_CHECKS = 1');
   
   if (mongoose.connection.db) {
     const collections = await mongoose.connection.db.collections();

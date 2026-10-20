@@ -4,5 +4,6 @@ module.exports = {
   setupFilesAfterEnv: ['./tests/setup.js'],
   coverageDirectory: 'coverage',
   collectCoverageFrom: ['src/**/*.js', '!src/server.js'],
-  testTimeout: 30000
+  testTimeout: 30000,
+  maxWorkers: 1
 };
