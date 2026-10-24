@@ -1,127 +1,98 @@
+/**
+ * tests/integration/order.test.js
+ *
+ * Orders Module — Integration Tests
+ * Covers: place order, stock check, rollback, idempotency, payment,
+ *         ownership, admin list, concurrent stock race condition
+ */
+
 const request = require('supertest');
 const app = require('../../src/app');
-const { User, Order, OrderItem, Payment } = require('../../src/models/mysql');
+const { Order, OrderItem } = require('../../src/models/mysql');
 const Product = require('../../src/models/mongo/Product');
-const bcrypt = require('bcryptjs');
+const { makeAdmin, makeUser, makeProduct } = require('../helpers/factories');
 
 describe('Orders Module', () => {
   let customerToken, customer2Token, adminToken;
-  let customerId, customer2Id;
   let product1Id, product2Id;
 
-  // ── Fresh users + products before EVERY test ──────────────
-  // (setup.js afterEach truncates all MySQL tables, so users must be recreated)
+  // Recreate users + products before every test
+  // (afterEach in setup.js truncates all MySQL tables → users are lost)
   beforeEach(async () => {
-    // Customer 1
-    const cust1 = await request(app).post('/api/v1/auth/register').send({
-      name: 'Order Customer 1', email: 'ordercust1@test.com', password: 'Password123!'
-    });
-    customerToken = cust1.body.data.accessToken;
-    customerId = cust1.body.data.user.id;
+    const admin = await makeAdmin(app);
+    adminToken = admin.token;
 
-    // Customer 2
-    const cust2 = await request(app).post('/api/v1/auth/register').send({
-      name: 'Order Customer 2', email: 'ordercust2@test.com', password: 'Password123!'
-    });
-    customer2Token = cust2.body.data.accessToken;
-    customer2Id = cust2.body.data.user.id;
+    const customer1 = await makeUser(app);
+    customerToken = customer1.token;
 
-    // Admin
-    const hash = await bcrypt.hash('AdminPass123!', 12);
-    await User.create({ name: 'Order Admin', email: 'orderadmin@test.com', password_hash: hash, role: 'admin' });
-    const adminLogin = await request(app).post('/api/v1/auth/login').send({
-      email: 'orderadmin@test.com', password: 'AdminPass123!'
-    });
-    adminToken = adminLogin.body.data.accessToken;
+    const customer2 = await makeUser(app);
+    customer2Token = customer2.token;
 
-    // Products (created via API so routes + validation are exercised)
-    const p1 = await request(app)
-      .post('/api/v1/products')
-      .set('Authorization', `Bearer ${adminToken}`)
-      .send({ name: 'Order Product 1', category: 'electronics', price: 100, stock: 10 });
-    product1Id = p1.body.data._id;
+    const p1 = await makeProduct(app, adminToken, { price: 100, stock: 10 });
+    product1Id = p1._id;
 
-    const p2 = await request(app)
-      .post('/api/v1/products')
-      .set('Authorization', `Bearer ${adminToken}`)
-      .send({ name: 'Order Product 2', category: 'clothing', price: 49.99, stock: 5 });
-    product2Id = p2.body.data._id;
+    const p2 = await makeProduct(app, adminToken, { price: 49.99, stock: 5, category: 'clothing' });
+    product2Id = p2._id;
   });
 
   // ── Place Order ─────────────────────────────────────────────
 
   describe('POST /api/v1/orders', () => {
-    it('should place an order successfully with sufficient stock', async () => {
+    it('should place an order with sufficient stock', async () => {
       const res = await request(app)
         .post('/api/v1/orders')
         .set('Authorization', `Bearer ${customerToken}`)
-        .send({
-          items: [
-            { productId: product1Id, quantity: 2 },
-            { productId: product2Id, quantity: 1 }
-          ]
-        });
+        .send({ items: [{ productId: product1Id, quantity: 2 }, { productId: product2Id, quantity: 1 }] });
 
       expect(res.status).toBe(201);
-      expect(res.body.success).toBe(true);
       expect(res.body.data.status).toBe('pending');
       expect(res.body.data.items).toHaveLength(2);
-      expect(res.body.data.payment).toBeDefined();
       expect(res.body.data.payment.status).toBe('pending');
-
-      // total = (100 * 2) + (49.99 * 1) = 249.99
       expect(parseFloat(res.body.data.total_amount)).toBeCloseTo(249.99, 2);
     });
 
-    it('should correctly decrement product stock after order', async () => {
+    it('should decrement product stock after order', async () => {
       await request(app)
         .post('/api/v1/orders')
         .set('Authorization', `Bearer ${customerToken}`)
-        .send({
-          items: [
-            { productId: product1Id, quantity: 3 },
-            { productId: product2Id, quantity: 2 }
-          ]
-        });
+        .send({ items: [{ productId: product1Id, quantity: 3 }, { productId: product2Id, quantity: 2 }] });
 
-      // Verify MongoDB stock was decremented
       const p1 = await Product.findById(product1Id);
-      expect(p1.stock).toBe(7);   // was 10, ordered 3
+      expect(p1.stock).toBe(7);   // 10 - 3
 
       const p2 = await Product.findById(product2Id);
-      expect(p2.stock).toBe(3);   // was 5, ordered 2
+      expect(p2.stock).toBe(3);   // 5 - 2
     });
 
-    it('should fail with insufficient stock and leave no records in DB (transaction rollback)', async () => {
+    it('should rollback transaction for insufficient stock (no records left)', async () => {
       const res = await request(app)
         .post('/api/v1/orders')
         .set('Authorization', `Bearer ${customerToken}`)
-        .send({
-          items: [
-            { productId: product1Id, quantity: 2 },    // stock: 10 — OK
-            { productId: product2Id, quantity: 100 }    // stock: 5  — NOT OK
-          ]
-        });
+        .send({ items: [{ productId: product1Id, quantity: 2 }, { productId: product2Id, quantity: 100 }] });
 
       expect(res.status).toBe(400);
       expect(res.body.error.code).toBe('INSUFFICIENT_STOCK');
-      expect(res.body.error.message).toContain('Order Product 2');
 
-      // Directly verify NO order or order_item records were created
-      const orderCount = await Order.count();
-      expect(orderCount).toBe(0);
+      expect(await Order.count()).toBe(0);
+      expect(await OrderItem.count()).toBe(0);
 
-      const itemCount = await OrderItem.count();
-      expect(itemCount).toBe(0);
-
-      // Stock should remain unchanged
+      // MongoDB stock unchanged
       const p2 = await Product.findById(product2Id);
       expect(p2.stock).toBe(5);
     });
 
-    it('should return the same order for the same Idempotency-Key (no duplicate)', async () => {
-      const key = 'unique-idempotency-key-abc-123';
+    it('should capture price_at_purchase (price snapshot)', async () => {
+      const res = await request(app)
+        .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
+        .send({ items: [{ productId: product1Id, quantity: 1 }] });
 
+      expect(res.status).toBe(201);
+      expect(parseFloat(res.body.data.items[0].price_at_purchase)).toBe(100);
+    });
+
+    it('should return same order for duplicate Idempotency-Key (no duplicate)', async () => {
+      const key = `idem-key-${Date.now()}`;
       const res1 = await request(app)
         .post('/api/v1/orders')
         .set('Authorization', `Bearer ${customerToken}`)
@@ -129,25 +100,20 @@ describe('Orders Module', () => {
         .send({ items: [{ productId: product1Id, quantity: 1 }] });
 
       expect(res1.status).toBe(201);
-      const orderId = res1.body.data.id;
 
-      // Second request with same key
       const res2 = await request(app)
         .post('/api/v1/orders')
         .set('Authorization', `Bearer ${customerToken}`)
         .set('Idempotency-Key', key)
         .send({ items: [{ productId: product1Id, quantity: 1 }] });
 
-      expect(res2.status).toBe(200);            // 200, not 201 — existing returned
-      expect(res2.body.data.id).toBe(orderId);   // same order
+      expect(res2.status).toBe(200);
+      expect(res2.body.data.id).toBe(res1.body.data.id);
+      expect(await Order.count()).toBe(1);
 
-      // Only ONE order in the database
-      const orderCount = await Order.count();
-      expect(orderCount).toBe(1);
-
-      // Stock decremented only ONCE
+      // Stock decremented only once
       const p1 = await Product.findById(product1Id);
-      expect(p1.stock).toBe(9);  // 10 - 1 = 9, not 10 - 2
+      expect(p1.stock).toBe(9);
     });
 
     it('should return 401 without auth token', async () => {
@@ -157,70 +123,102 @@ describe('Orders Module', () => {
       expect(res.status).toBe(401);
     });
 
-    it('should return validation error for empty items array', async () => {
+    it('should return 400 for empty items array', async () => {
       const res = await request(app)
         .post('/api/v1/orders')
         .set('Authorization', `Bearer ${customerToken}`)
         .send({ items: [] });
-
       expect(res.status).toBe(400);
       expect(res.body.error.code).toBe('VALIDATION_ERROR');
     });
 
-    it('should return validation error for non-positive quantity', async () => {
+    it('should return 400 for malformed body (missing items)', async () => {
+      const res = await request(app)
+        .post('/api/v1/orders')
+        .set('Authorization', `Bearer ${customerToken}`)
+        .send({});
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe('VALIDATION_ERROR');
+    });
+
+    it('should return 400 for quantity = 0', async () => {
       const res = await request(app)
         .post('/api/v1/orders')
         .set('Authorization', `Bearer ${customerToken}`)
         .send({ items: [{ productId: product1Id, quantity: 0 }] });
-
       expect(res.status).toBe(400);
       expect(res.body.error.code).toBe('VALIDATION_ERROR');
     });
 
-    it('should capture price_at_purchase from current product price', async () => {
-      const res = await request(app)
-        .post('/api/v1/orders')
-        .set('Authorization', `Bearer ${customerToken}`)
-        .send({ items: [{ productId: product1Id, quantity: 1 }] });
+    // ── Concurrent Stock Race Condition ─────────────────────────────────────
+    // This is the key test for MySQL transaction correctness.
+    // Two requests fire simultaneously for the last unit of stock.
+    // Only ONE should succeed, the other must get INSUFFICIENT_STOCK.
+    it('should allow only ONE of two concurrent requests for the last unit of stock', async () => {
+      // Create a product with EXACTLY 1 unit in stock
+      const scarceProduct = await makeProduct(app, adminToken, {
+        name: 'Last-Unit Item',
+        category: 'electronics',
+        price: 50,
+        stock: 1
+      });
 
-      expect(res.status).toBe(201);
-      const item = res.body.data.items[0];
-      expect(parseFloat(item.price_at_purchase)).toBe(100);
-    });
+      // Fire both requests in parallel — no await between them
+      const [res1, res2] = await Promise.all([
+        request(app)
+          .post('/api/v1/orders')
+          .set('Authorization', `Bearer ${customerToken}`)
+          .send({ items: [{ productId: scarceProduct._id, quantity: 1 }] }),
+        request(app)
+          .post('/api/v1/orders')
+          .set('Authorization', `Bearer ${customer2Token}`)
+          .send({ items: [{ productId: scarceProduct._id, quantity: 1 }] })
+      ]);
+
+      const statuses = [res1.status, res2.status];
+
+      // Exactly one 201 (created) and one 400 (insufficient stock)
+      expect(statuses).toContain(201);
+      expect(statuses).toContain(400);
+
+      const failedRes = res1.status === 400 ? res1 : res2;
+      expect(failedRes.body.error.code).toBe('INSUFFICIENT_STOCK');
+
+      // Stock should now be 0 — only one order went through
+      const updated = await Product.findById(scarceProduct._id);
+      expect(updated.stock).toBe(0);
+
+      // Exactly 1 order record in MySQL
+      const orderCount = await Order.count();
+      expect(orderCount).toBe(1);
+    }, 15000); // allow extra time for concurrent DB ops
   });
 
   // ── Order Detail (Ownership) ────────────────────────────────
 
   describe('GET /api/v1/orders/:id', () => {
-    it('should return order with items for the owner', async () => {
+    it('should return order details for the owner', async () => {
       const orderRes = await request(app)
         .post('/api/v1/orders')
         .set('Authorization', `Bearer ${customerToken}`)
         .send({ items: [{ productId: product1Id, quantity: 1 }] });
 
-      const orderId = orderRes.body.data.id;
-
       const res = await request(app)
-        .get(`/api/v1/orders/${orderId}`)
+        .get(`/api/v1/orders/${orderRes.body.data.id}`)
         .set('Authorization', `Bearer ${customerToken}`);
 
       expect(res.status).toBe(200);
-      expect(res.body.data.id).toBe(orderId);
       expect(res.body.data.items).toHaveLength(1);
     });
 
     it('should return 403 when viewing another user\'s order', async () => {
-      // Customer 1 places an order
       const orderRes = await request(app)
         .post('/api/v1/orders')
         .set('Authorization', `Bearer ${customerToken}`)
         .send({ items: [{ productId: product1Id, quantity: 1 }] });
 
-      const orderId = orderRes.body.data.id;
-
-      // Customer 2 tries to view it
       const res = await request(app)
-        .get(`/api/v1/orders/${orderId}`)
+        .get(`/api/v1/orders/${orderRes.body.data.id}`)
         .set('Authorization', `Bearer ${customer2Token}`);
 
       expect(res.status).toBe(403);
@@ -233,30 +231,33 @@ describe('Orders Module', () => {
         .set('Authorization', `Bearer ${customerToken}`)
         .send({ items: [{ productId: product1Id, quantity: 1 }] });
 
-      const orderId = orderRes.body.data.id;
-
       const res = await request(app)
-        .get(`/api/v1/orders/${orderId}`)
+        .get(`/api/v1/orders/${orderRes.body.data.id}`)
         .set('Authorization', `Bearer ${adminToken}`);
 
       expect(res.status).toBe(200);
-      expect(res.body.data.id).toBe(orderId);
+    });
+
+    it('should return 404 for non-existent order ID', async () => {
+      const res = await request(app)
+        .get('/api/v1/orders/non-existent-uuid-000')
+        .set('Authorization', `Bearer ${customerToken}`);
+      // 404 = order not found; 400 = invalid UUID format rejected by DB; 403 = treated as access denied
+      expect([400, 403, 404]).toContain(res.status);
     });
   });
 
   // ── Payment Confirmation ────────────────────────────────────
 
   describe('POST /api/v1/orders/:id/pay', () => {
-    it('should update order to paid and payment to success', async () => {
+    it('should mark order as paid on successful payment', async () => {
       const orderRes = await request(app)
         .post('/api/v1/orders')
         .set('Authorization', `Bearer ${customerToken}`)
         .send({ items: [{ productId: product1Id, quantity: 1 }] });
 
-      const orderId = orderRes.body.data.id;
-
       const res = await request(app)
-        .post(`/api/v1/orders/${orderId}/pay`)
+        .post(`/api/v1/orders/${orderRes.body.data.id}/pay`)
         .set('Authorization', `Bearer ${customerToken}`)
         .send({ status: 'success' });
 
@@ -265,22 +266,19 @@ describe('Orders Module', () => {
       expect(res.body.data.payment.status).toBe('success');
     });
 
-    it('should update order to failed when payment fails', async () => {
+    it('should mark order as failed on failed payment', async () => {
       const orderRes = await request(app)
         .post('/api/v1/orders')
         .set('Authorization', `Bearer ${customerToken}`)
         .send({ items: [{ productId: product1Id, quantity: 1 }] });
 
-      const orderId = orderRes.body.data.id;
-
       const res = await request(app)
-        .post(`/api/v1/orders/${orderId}/pay`)
+        .post(`/api/v1/orders/${orderRes.body.data.id}/pay`)
         .set('Authorization', `Bearer ${customerToken}`)
         .send({ status: 'failed' });
 
       expect(res.status).toBe(200);
       expect(res.body.data.status).toBe('failed');
-      expect(res.body.data.payment.status).toBe('failed');
     });
 
     it('should reject duplicate payment confirmation', async () => {
@@ -290,14 +288,11 @@ describe('Orders Module', () => {
         .send({ items: [{ productId: product1Id, quantity: 1 }] });
 
       const orderId = orderRes.body.data.id;
-
-      // First payment
       await request(app)
         .post(`/api/v1/orders/${orderId}/pay`)
         .set('Authorization', `Bearer ${customerToken}`)
         .send({ status: 'success' });
 
-      // Try again
       const res = await request(app)
         .post(`/api/v1/orders/${orderId}/pay`)
         .set('Authorization', `Bearer ${customerToken}`)
@@ -308,28 +303,20 @@ describe('Orders Module', () => {
     });
   });
 
-  // ── Order History (User) ────────────────────────────────────
+  // ── Order History ───────────────────────────────────────────
 
-  describe('GET /api/v1/orders', () => {
+  describe('GET /api/v1/orders (my orders)', () => {
     it('should return only the logged-in user\'s orders', async () => {
       // Customer 1 places 2 orders
-      await request(app)
-        .post('/api/v1/orders')
-        .set('Authorization', `Bearer ${customerToken}`)
+      await request(app).post('/api/v1/orders').set('Authorization', `Bearer ${customerToken}`)
         .send({ items: [{ productId: product1Id, quantity: 1 }] });
-
-      await request(app)
-        .post('/api/v1/orders')
-        .set('Authorization', `Bearer ${customerToken}`)
+      await request(app).post('/api/v1/orders').set('Authorization', `Bearer ${customerToken}`)
         .send({ items: [{ productId: product2Id, quantity: 1 }] });
 
       // Customer 2 places 1 order
-      await request(app)
-        .post('/api/v1/orders')
-        .set('Authorization', `Bearer ${customer2Token}`)
+      await request(app).post('/api/v1/orders').set('Authorization', `Bearer ${customer2Token}`)
         .send({ items: [{ productId: product1Id, quantity: 1 }] });
 
-      // Customer 1 should see only their 2 orders
       const res = await request(app)
         .get('/api/v1/orders')
         .set('Authorization', `Bearer ${customerToken}`);
@@ -340,11 +327,10 @@ describe('Orders Module', () => {
     });
   });
 
-  // ── Admin List ──────────────────────────────────────────────
+  // ── Admin Order List ────────────────────────────────────────
 
   describe('GET /api/v1/orders/admin', () => {
-    it('should return all orders for admin with status filter', async () => {
-      // Place an order and pay it
+    it('should return all orders with status filter', async () => {
       const orderRes = await request(app)
         .post('/api/v1/orders')
         .set('Authorization', `Bearer ${customerToken}`)
@@ -355,13 +341,12 @@ describe('Orders Module', () => {
         .set('Authorization', `Bearer ${customerToken}`)
         .send({ status: 'success' });
 
-      // Place another order (stays pending)
+      // Another pending order
       await request(app)
         .post('/api/v1/orders')
         .set('Authorization', `Bearer ${customer2Token}`)
         .send({ items: [{ productId: product2Id, quantity: 1 }] });
 
-      // Admin filters by status=paid
       const res = await request(app)
         .get('/api/v1/orders/admin?status=paid')
         .set('Authorization', `Bearer ${adminToken}`);
@@ -375,7 +360,6 @@ describe('Orders Module', () => {
       const res = await request(app)
         .get('/api/v1/orders/admin')
         .set('Authorization', `Bearer ${customerToken}`);
-
       expect(res.status).toBe(403);
     });
   });

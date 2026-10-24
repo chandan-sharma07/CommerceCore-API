@@ -50,7 +50,11 @@ const placeOrder = async (userId, items, idempotencyKey) => {
     quantityByProduct[item.productId] = (quantityByProduct[item.productId] || 0) + item.quantity;
   }
 
-  // ── 4. Verify stock sufficiency ───────────────────────────
+  // ── 4. Pre-flight stock check (non-atomic, fast-fail for obvious shortages) ──
+  // This is an optimistic early check only — the real atomic enforcement
+  // happens in step 7 via MongoDB findOneAndUpdate with a conditional filter.
+  // This step avoids opening a MySQL transaction unnecessarily when stock is
+  // clearly 0 or the requested quantity far exceeds available stock.
   for (const [productId, totalQty] of Object.entries(quantityByProduct)) {
     const product = productMap.get(productId);
     if (product.stock < totalQty) {
@@ -78,7 +82,45 @@ const placeOrder = async (userId, items, idempotencyKey) => {
 
   totalAmount = Math.round(totalAmount * 100) / 100;
 
-  // ── 6. MySQL transaction: order + items + payment ─────────
+  // ── 6. ATOMIC stock reservation in MongoDB ────────────────
+  // Use findOneAndUpdate with a conditional filter ($gte) to atomically
+  // decrement stock ONLY if sufficient stock still exists.
+  // This is the real race-condition guard: two concurrent requests for the
+  // last unit will both pass step 4 (both see stock=1), but only ONE will
+  // win the atomic CAS here — the other gets null back → INSUFFICIENT_STOCK.
+  // On failure we throw BEFORE opening the MySQL transaction (no rollback needed).
+  const stockReservations = []; // track which products were decremented for rollback
+
+  try {
+    for (const [productId, qty] of Object.entries(quantityByProduct)) {
+      const product = productMap.get(productId);
+      const updated = await Product.findOneAndUpdate(
+        { _id: productId, stock: { $gte: qty } }, // atomic guard
+        { $inc: { stock: -qty } },
+        { new: true }
+      );
+
+      if (!updated) {
+        // Another request beat us — rollback already-decremented products
+        for (const { pid, q } of stockReservations) {
+          await Product.findByIdAndUpdate(pid, { $inc: { stock: q } });
+        }
+        throw new AppError(
+          `Insufficient stock for "${product.name}". Requested: ${qty}`,
+          400,
+          'INSUFFICIENT_STOCK'
+        );
+      }
+
+      stockReservations.push({ pid: productId, q: qty });
+    }
+  } catch (err) {
+    // Re-throw AppErrors (INSUFFICIENT_STOCK) directly; wrap unexpected errors
+    if (err.statusCode) throw err;
+    throw new AppError(`Stock reservation failed: ${err.message}`, 500, 'STOCK_ERROR');
+  }
+
+  // ── 7. MySQL transaction: order + items + payment ─────────
   const transaction = await sequelize.transaction();
 
   try {
@@ -103,27 +145,6 @@ const placeOrder = async (userId, items, idempotencyKey) => {
 
     logger.info(`Order ${order.id} placed by user ${userId}, total: ${totalAmount}`);
 
-    // ── 7. Stock decrement in MongoDB (post-commit) ─────────
-    // CROSS-DB CONSISTENCY NOTE:
-    // MongoDB operations CANNOT participate in MySQL transactions. The stock
-    // decrement happens immediately after the MySQL commit succeeds. If MongoDB
-    // is unreachable or the decrement fails (network error, crash, etc.), the
-    // order is marked "stock_sync_failed" so it can be reconciled later via a
-    // background job or admin action. This is an accepted trade-off in polyglot
-    // persistence architectures — full distributed transactions (2PC/Saga) are
-    // not used here to keep complexity manageable.
-    try {
-      for (const [productId, qty] of Object.entries(quantityByProduct)) {
-        await Product.findByIdAndUpdate(productId, { $inc: { stock: -qty } });
-      }
-    } catch (stockErr) {
-      logger.error(`Stock sync failed for order ${order.id}: ${stockErr.message}`);
-      await Order.update(
-        { status: 'stock_sync_failed' },
-        { where: { id: order.id } }
-      );
-    }
-
     // ── 8. Return complete order ────────────────────────────
     const completeOrder = await Order.findByPk(order.id, {
       include: [
@@ -135,6 +156,17 @@ const placeOrder = async (userId, items, idempotencyKey) => {
     return { order: completeOrder, created: true };
   } catch (err) {
     await transaction.rollback();
+
+    // MySQL commit failed — restore MongoDB stock that was atomically decremented above
+    logger.warn(`MySQL transaction failed for user ${userId}, restoring MongoDB stock reservations`);
+    for (const { pid, q } of stockReservations) {
+      try {
+        await Product.findByIdAndUpdate(pid, { $inc: { stock: q } });
+      } catch (restoreErr) {
+        logger.error(`Failed to restore stock for product ${pid}: ${restoreErr.message}`);
+      }
+    }
+
     throw err;
   }
 };
@@ -237,12 +269,18 @@ const getUserOrders = async (userId, { page = 1, limit = 10 }) => {
  * @returns {Promise<Object>} Order with items and payment
  */
 const getById = async (orderId, userId, userRole) => {
-  const order = await Order.findByPk(orderId, {
-    include: [
-      { model: OrderItem, as: 'items' },
-      { model: Payment, as: 'payment' }
-    ]
-  });
+  let order;
+  try {
+    order = await Order.findByPk(orderId, {
+      include: [
+        { model: OrderItem, as: 'items' },
+        { model: Payment, as: 'payment' }
+      ]
+    });
+  } catch (_dbErr) {
+    // Invalid UUID format or other DB error → treat as not found
+    throw new AppError('Order not found', 404, 'NOT_FOUND');
+  }
 
   if (!order) {
     throw new AppError('Order not found', 404, 'NOT_FOUND');
