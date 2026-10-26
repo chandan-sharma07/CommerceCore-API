@@ -59,12 +59,12 @@ const transports = [
 ];
 
 // Production: persist error + combined logs to files
-if (process.env.NODE_ENV === 'production') {
-  transports.push(
-    new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
-    new winston.transports.File({ filename: 'logs/combined.log' })
-  );
-}
+// if (process.env.NODE_ENV === 'production') {
+//   transports.push(
+//     new winston.transports.File({ filename: 'logs/error.log', level: 'error' }),
+//     new winston.transports.File({ filename: 'logs/combined.log' })
+//   );
+// }
 
 // ── Logger Instance ───────────────────────────────────────────
 
@@ -79,16 +79,10 @@ const logger = winston.createLogger({
   transports,
   // Log uncaught exceptions and unhandled rejections via Winston
   exceptionHandlers: [
-    new winston.transports.Console(),
-    ...(process.env.NODE_ENV === 'production'
-      ? [new winston.transports.File({ filename: 'logs/exceptions.log' })]
-      : [])
+    new winston.transports.Console()
   ],
   rejectionHandlers: [
-    new winston.transports.Console(),
-    ...(process.env.NODE_ENV === 'production'
-      ? [new winston.transports.File({ filename: 'logs/rejections.log' })]
-      : [])
+    new winston.transports.Console()
   ],
   exitOnError: false // let server.js handle graceful shutdown
 });
