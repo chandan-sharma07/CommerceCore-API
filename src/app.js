@@ -89,22 +89,168 @@ const swaggerSpec = swaggerJsdoc({
     info: {
       title: 'CommerceCore API',
       version: '1.0.0',
-      description: 'Mini e-commerce REST API'
+      description: [
+        'Production-grade e-commerce REST API built to demonstrate real backend depth.',
+        '',
+        '**Key Features:**',
+        '- JWT auth with refresh-token rotation',
+        '- MySQL (Sequelize) + MongoDB (Mongoose) polyglot persistence',
+        '- Redis caching with pattern-based cache invalidation',
+        '- ACID-safe order transactions with cross-DB stock consistency',
+        '- Race-condition-safe stock reservation via MongoDB atomic CAS',
+        '- Idempotency keys on order placement',
+        '',
+        '**How to authenticate:** Click **Authorize** → paste your `accessToken` as `Bearer <token>`.'
+      ].join('\n')
     },
-    servers: [{ url: '/api/v1' }],
+    servers: [
+      { url: '/api/v1', description: 'Current server' }
+    ],
     components: {
       securitySchemes: {
         bearerAuth: {
           type: 'http',
           scheme: 'bearer',
-          bearerFormat: 'JWT'
+          bearerFormat: 'JWT',
+          description: 'Paste your access token (obtained from /auth/login or /auth/register)'
+        }
+      },
+      schemas: {
+        AuthResponse: {
+          type: 'object',
+          properties: {
+            success: { type: 'boolean' },
+            data: {
+              type: 'object',
+              properties: {
+                user: {
+                  type: 'object',
+                  properties: {
+                    id: { type: 'string' },
+                    name: { type: 'string' },
+                    email: { type: 'string' },
+                    role: { type: 'string', enum: ['customer', 'admin'] }
+                  }
+                },
+                accessToken: { type: 'string', description: 'Short-lived JWT (15m default)' },
+                refreshToken: { type: 'string', description: 'Long-lived opaque token (7d default)' }
+              }
+            }
+          }
+        },
+        Product: {
+          type: 'object',
+          properties: {
+            _id: { type: 'string', description: 'MongoDB ObjectId' },
+            name: { type: 'string' },
+            description: { type: 'string' },
+            price: { type: 'number' },
+            stock: { type: 'integer' },
+            category: { type: 'string', enum: ['electronics', 'clothing', 'books', 'home', 'sports', 'toys', 'food', 'beauty', 'other'] },
+            imageUrl: { type: 'string' },
+            createdAt: { type: 'string', format: 'date-time' },
+            updatedAt: { type: 'string', format: 'date-time' }
+          }
+        },
+        ProductInput: {
+          type: 'object',
+          required: ['name', 'price', 'stock', 'category'],
+          properties: {
+            name: { type: 'string', example: 'Wireless Headphones' },
+            description: { type: 'string', example: 'Over-ear noise cancelling headphones' },
+            price: { type: 'number', example: 79.99 },
+            stock: { type: 'integer', example: 50 },
+            category: { type: 'string', enum: ['electronics', 'clothing', 'books', 'home', 'sports', 'toys', 'food', 'beauty', 'other'], example: 'electronics' },
+            imageUrl: { type: 'string', example: 'https://example.com/image.jpg' }
+          }
+        },
+        Review: {
+          type: 'object',
+          properties: {
+            _id: { type: 'string' },
+            productId: { type: 'string' },
+            userId: { type: 'string' },
+            userName: { type: 'string' },
+            rating: { type: 'integer', minimum: 1, maximum: 5 },
+            comment: { type: 'string' },
+            createdAt: { type: 'string', format: 'date-time' }
+          }
+        },
+        ReviewInput: {
+          type: 'object',
+          required: ['productId', 'rating'],
+          properties: {
+            productId: { type: 'string', example: '64f1a2b3c4d5e6f7a8b9c0d1' },
+            rating: { type: 'integer', minimum: 1, maximum: 5, example: 4 },
+            comment: { type: 'string', example: 'Great product, fast delivery!' }
+          }
+        },
+        Order: {
+          type: 'object',
+          properties: {
+            id: { type: 'string', format: 'uuid' },
+            user_id: { type: 'string' },
+            status: { type: 'string', enum: ['pending', 'paid', 'failed', 'stock_sync_failed'] },
+            total_amount: { type: 'number' },
+            items: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  product_id: { type: 'string' },
+                  quantity: { type: 'integer' },
+                  price_at_purchase: { type: 'number' }
+                }
+              }
+            },
+            payment: {
+              type: 'object',
+              properties: {
+                id: { type: 'string' },
+                status: { type: 'string', enum: ['pending', 'success', 'failed'] }
+              }
+            },
+            created_at: { type: 'string', format: 'date-time' }
+          }
+        },
+        Pagination: {
+          type: 'object',
+          properties: {
+            page: { type: 'integer' },
+            limit: { type: 'integer' },
+            total: { type: 'integer' },
+            totalPages: { type: 'integer' },
+            hasNextPage: { type: 'boolean' }
+          }
+        },
+        ErrorResponse: {
+          type: 'object',
+          properties: {
+            success: { type: 'boolean', example: false },
+            error: {
+              type: 'object',
+              properties: {
+                code: { type: 'string', example: 'VALIDATION_ERROR' },
+                message: { type: 'string', example: 'Invalid input data' },
+                requestId: { type: 'string' }
+              }
+            }
+          }
         }
       }
     }
   },
   apis: ['./src/modules/**/*.routes.js', './src/routes/**/*.js']
 });
-app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec));
+
+// Swagger UI at /api/v1/docs (mounted BEFORE the v1 rate limiter below)
+app.use('/api/v1/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
+  customSiteTitle: 'CommerceCore API Docs',
+  swaggerOptions: {
+    persistAuthorization: true  // keeps token across page refreshes
+  }
+}));
 
 // ── Rate limiting ─────────────────────────────────────────────
 // Auth routes get strict limit (5/15min) — applied BEFORE general limiter

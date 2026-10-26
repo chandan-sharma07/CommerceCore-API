@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "nodemon src/server.js",
     "start": "node src/server.js",
+    "seed": "node src/scripts/seed.js",
     "test": "cross-env NODE_ENV=test jest --forceExit --detectOpenHandles",
     "test:coverage": "cross-env NODE_ENV=test jest --forceExit --detectOpenHandles --coverage",
     "test:watch": "cross-env NODE_ENV=test jest --watch --forceExit --detectOpenHandles",

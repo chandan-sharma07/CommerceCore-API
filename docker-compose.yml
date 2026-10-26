@@ -1,5 +1,6 @@
-version: '3.8'
 services:
+  # ── Databases ────────────────────────────────────────────────────────────────
+
   mysql:
     image: mysql:8.0
     environment:
@@ -15,7 +16,7 @@ services:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
       interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
 
   mongo:
     image: mongo:7.0
@@ -27,7 +28,7 @@ services:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
 
   redis:
     image: redis:7-alpine
@@ -39,7 +40,38 @@ services:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
+
+  # ── Application ───────────────────────────────────────────────────────────────
+
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      MYSQL_HOST: mysql
+      MYSQL_PORT: 3306
+      MYSQL_USER: commerce_user
+      MYSQL_PASSWORD: commerce_pass
+      MYSQL_DATABASE: commercecore
+      MONGO_URI: mongodb://mongo:27017/commercecore
+      REDIS_URL: redis://redis:6379
+      JWT_ACCESS_SECRET: change_this_secret_in_production_min_32_chars
+      JWT_REFRESH_SECRET: change_this_refresh_secret_in_production_min_32
+      JWT_ACCESS_EXPIRY: 15m
+      JWT_REFRESH_EXPIRY: 7d
+      LOG_LEVEL: info
+      CORS_ORIGIN: "*"
+    depends_on:
+      mysql:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   mysql_data:
